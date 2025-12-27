@@ -5,7 +5,7 @@ A simple, lightweight Go library for common file operations. Designed for ease o
 ## Installation
 
 ```bash
-go get github.com/yourname/fio
+go get github.com/dreamph/fio
 ```
 
 ## Features
@@ -24,7 +24,7 @@ package main
 
 import (
 	"fmt"
-	"github.com/yourname/fio"
+	"github.com/dreamph/fio"
 )
 
 func main() {
