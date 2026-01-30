@@ -199,7 +199,7 @@ func benchFioDo(b *testing.B, size int, src sourceFactory, mgr fio.IoManager) {
 	}
 }
 
-func BenchmarkCompareFioSio(b *testing.B) {
+func BenchmarkCompareFio(b *testing.B) {
 	useMmap := envBool("FIO_BENCH_USE_MMAP", false)
 
 	opsPerSessionList := []int{1}

@@ -1,5 +1,3 @@
-// Package fio provides streaming I/O utilities with session management,
-// automatic resource cleanup, and flexible storage backends (memory/file).
 package fio
 
 import (

@@ -336,6 +336,7 @@ func TestWriteFileHelpers(t *testing.T) {
 func TestReadLinesHelpers(t *testing.T) {
 	ctx, _ := newTestSession(t, Memory)
 	path := filepath.Join(t.TempDir(), "lines.txt")
+
 	if err := os.WriteFile(path, []byte("l1\nl2"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}

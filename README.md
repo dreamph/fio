@@ -535,8 +535,8 @@ Benchmark comparing `fio` and `normal` (standard library io.Copy) on Apple M2 Ma
 
 ```bash
 # Basic benchmark
-go test -bench=BenchmarkCompareFioSio -benchmem -benchtime=3s
+go test -bench=BenchmarkCompareFio -benchmem -benchtime=3s
 
 # With mmap enabled (Unix only)
-FIO_BENCH_USE_MMAP=true go test -bench=BenchmarkCompareFioSio -benchmem -benchtime=3s
+FIO_BENCH_USE_MMAP=true go test -bench=BenchmarkCompareFio -benchmem -benchtime=3s
 ```
