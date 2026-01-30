@@ -47,8 +47,12 @@ output, _ := fio.Copy(ctx, source, fio.Out(".json"))
 
 ## Installation
 
+```bash
+go get github.com/dreamph/fio
+```
+
 ```go
-import "github.com/dreamph/sio/fio"
+import "github.com/dreamph/fio"
 ```
 
 ## Quick Start
