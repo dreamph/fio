@@ -2,955 +2,515 @@ package fio
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
-	"io/fs"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
-// ---------- Test Helpers ----------
+type noSizeReader struct{}
 
-func tempDir(t *testing.T) string {
+func (noSizeReader) Read(p []byte) (int, error) { return 0, io.EOF }
+
+func newTestSession(t *testing.T, storage StorageType) (context.Context, IoSession) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "fio-test-*")
+
+	mgr, err := NewIoManager(t.TempDir(), storage)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewIoManager: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return dir
-}
+	t.Cleanup(func() { _ = mgr.Cleanup() })
 
-func tempFile(t *testing.T, dir, name, content string) string {
-	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// ---------- Read Tests ----------
-
-func TestRead(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello world")
-
-	data, err := Read(path)
+	ses, err := mgr.NewSession()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewSession: %v", err)
 	}
-	if string(data) != "hello world" {
-		t.Errorf("got %q, want %q", data, "hello world")
-	}
+	t.Cleanup(func() { _ = ses.Cleanup() })
+
+	return WithSession(context.Background(), ses), ses
 }
 
-func TestRead_NotFound(t *testing.T) {
-	_, err := Read("/nonexistent/path")
-	if err == nil {
-		t.Error("expected error for nonexistent file")
-	}
-}
-
-func TestReadLimit(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello world")
-
-	// Within limit
-	data, err := ReadLimit(path, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello world" {
-		t.Errorf("got %q, want %q", data, "hello world")
+func TestStorageTypeString(t *testing.T) {
+	tests := []struct {
+		st   StorageType
+		want string
+	}{
+		{File, "file"},
+		{Memory, "memory"},
 	}
 
-	// Exceeds limit
-	_, err = ReadLimit(path, 5)
-	if !errors.Is(err, ErrSizeExceedsLimit) {
-		t.Errorf("got %v, want ErrSizeExceedsLimit", err)
-	}
-
-	// Zero limit (read all)
-	data, err = ReadLimit(path, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello world" {
-		t.Errorf("got %q, want %q", data, "hello world")
-	}
-}
-
-func TestReadAt(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello world")
-
-	data, err := ReadAt(path, 6, 5)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "world" {
-		t.Errorf("got %q, want %q", data, "world")
-	}
-}
-
-func TestReadAt_EOF(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	// Request more than available
-	data, err := ReadAt(path, 0, 100)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", data, "hello")
-	}
-}
-
-func TestReadString(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello world")
-
-	s, err := ReadString(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s != "hello world" {
-		t.Errorf("got %q, want %q", s, "hello world")
-	}
-}
-
-func TestReadLines(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "line1\nline2\nline3")
-
-	var lines []string
-	err := ReadLines(path, func(line string) error {
-		lines = append(lines, line)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(lines) != 3 {
-		t.Errorf("got %d lines, want 3", len(lines))
-	}
-	if lines[0] != "line1" || lines[1] != "line2" || lines[2] != "line3" {
-		t.Errorf("got %v", lines)
-	}
-}
-
-func TestReadLines_StopOnError(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "line1\nline2\nline3")
-
-	stopErr := errors.New("stop")
-	count := 0
-	err := ReadLines(path, func(line string) error {
-		count++
-		if count == 2 {
-			return stopErr
+	for _, tt := range tests {
+		if got := tt.st.String(); got != tt.want {
+			t.Errorf("StorageType(%d).String() = %q, want %q", tt.st, got, tt.want)
 		}
-		return nil
-	})
-	if !errors.Is(err, stopErr) {
-		t.Errorf("got %v, want stopErr", err)
-	}
-	if count != 2 {
-		t.Errorf("got %d, want 2", count)
 	}
 }
 
-func TestReadJSON(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.json", `{"name":"test","value":42}`)
-
-	var data struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
+func TestToExtAndMB(t *testing.T) {
+	if got := ToExt("pdf"); got != ".pdf" {
+		t.Fatalf("ToExt = %q, want %q", got, ".pdf")
 	}
-	err := ReadJSON(path, &data)
+	if got := MB(2); got != 2*1024*1024 {
+		t.Fatalf("MB(2) = %d", got)
+	}
+}
+
+func TestOutOption(t *testing.T) {
+	opt := Out(".pdf")
+	if opt.Ext() != ".pdf" {
+		t.Fatalf("Ext = %q, want %q", opt.Ext(), ".pdf")
+	}
+	if opt.StorageTypeVal() != nil {
+		t.Fatalf("StorageTypeVal should be nil")
+	}
+
+	opt = Out(".pdf", Memory)
+	if opt.StorageTypeVal() == nil || *opt.StorageTypeVal() != Memory {
+		t.Fatalf("StorageTypeVal = %v, want Memory", opt.StorageTypeVal())
+	}
+
+	opt = Out(".txt", File)
+	if opt.StorageTypeVal() == nil || *opt.StorageTypeVal() != File {
+		t.Fatalf("StorageTypeVal = %v, want File", opt.StorageTypeVal())
+	}
+}
+
+func TestConfigure(t *testing.T) {
+	old := httpClient
+	t.Cleanup(func() { httpClient = old })
+
+	custom := &http.Client{}
+	if err := Configure(NewConfig(custom)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if httpClient != custom {
+		t.Fatalf("httpClient not updated")
+	}
+}
+
+func TestNewOutWithoutSession(t *testing.T) {
+	if _, err := NewOut(context.Background(), Out(".txt")); !errors.Is(err, ErrNoSession) {
+		t.Fatalf("expected ErrNoSession, got %v", err)
+	}
+}
+
+func TestAutoThresholdManager(t *testing.T) {
+	mgr, err := NewIoManager(t.TempDir(), Memory, WithThreshold(4))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewIoManager: %v", err)
 	}
-	if data.Name != "test" || data.Value != 42 {
-		t.Errorf("got %+v", data)
-	}
-}
+	t.Cleanup(func() { _ = mgr.Cleanup() })
 
-func TestReadJSONStream(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.json", `{"name":"test","value":42}`)
-
-	var data struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
-	}
-	err := ReadJSONStream(path, &data)
+	ses, err := mgr.NewSession()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewSession: %v", err)
 	}
-	if data.Name != "test" || data.Value != 42 {
-		t.Errorf("got %+v", data)
+	t.Cleanup(func() { _ = ses.Cleanup() })
+
+	out, err := ses.NewOut(Out(".txt"), 2)
+	if err != nil {
+		t.Fatalf("NewOut: %v", err)
+	}
+	if out.StorageType() != Memory {
+		t.Fatalf("StorageType = %v, want Memory", out.StorageType())
+	}
+
+	out, err = ses.NewOut(Out(".txt"), 8)
+	if err != nil {
+		t.Fatalf("NewOut: %v", err)
+	}
+	if out.StorageType() != File {
+		t.Fatalf("StorageType = %v, want File", out.StorageType())
 	}
 }
 
-func TestReadStream(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello world")
+func TestOutputWriteRead(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	var buf bytes.Buffer
-	err := ReadStream(path, func(r io.Reader) error {
-		_, err := io.Copy(&buf, r)
+	out, err := DoOut(ctx, Out(Txt), func(ctx context.Context, s *OutScope, w io.Writer) error {
+		_, err := w.Write([]byte("hello"))
 		return err
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("DoOut: %v", err)
 	}
-	if buf.String() != "hello world" {
-		t.Errorf("got %q, want %q", buf.String(), "hello world")
+
+	got, err := out.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("Bytes = %q, want %q", string(got), "hello")
 	}
 }
 
-// ---------- Write Tests ----------
+func TestCopyAndProcess(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-func TestWrite(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "subdir", "test.txt")
-
-	err := Write(path, []byte("hello"), 0o644)
+	out, err := Copy(ctx, BytesSource([]byte("abc")), Out(Txt))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Copy: %v", err)
+	}
+	got, _ := out.Bytes()
+	if string(got) != "abc" {
+		t.Fatalf("Copy bytes = %q", string(got))
 	}
 
-	data, err := Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", data, "hello")
-	}
-}
-
-func TestWriteString(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "test.txt")
-
-	err := WriteString(path, "hello", 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := ReadString(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s != "hello" {
-		t.Errorf("got %q, want %q", s, "hello")
-	}
-}
-
-func TestWriteJSON(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "test.json")
-
-	data := struct {
-		Name  string `json:"name"`
-		Value int    `json:"value"`
-	}{Name: "test", Value: 42}
-
-	err := WriteJSON(path, data, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	content, err := ReadString(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(content, `"name": "test"`) {
-		t.Errorf("got %q", content)
-	}
-}
-
-func TestSafeWrite(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "test.txt")
-
-	// Initial write
-	err := SafeWrite(path, []byte("version1"), 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Overwrite
-	err = SafeWrite(path, []byte("version2"), 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "version2" {
-		t.Errorf("got %q, want %q", data, "version2")
-	}
-
-	// Temp file should not exist
-	if Exists(path + ".tmp") {
-		t.Error("temp file should be removed")
-	}
-}
-
-func TestAppend(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "test.txt")
-
-	err := Append(path, []byte("hello"), 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = Append(path, []byte(" world"), 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello world" {
-		t.Errorf("got %q, want %q", data, "hello world")
-	}
-}
-
-func TestAppendLine(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "test.txt")
-
-	err := AppendLine(path, "line1", 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = AppendLine(path, "line2\n", 0o644) // Already has newline
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "line1\nline2\n" {
-		t.Errorf("got %q, want %q", data, "line1\nline2\n")
-	}
-}
-
-// ---------- Temp Tests ----------
-
-func TestCreateTemp(t *testing.T) {
-	path, err := CreateTemp("", "fio-test-*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer Remove(path)
-
-	if !Exists(path) {
-		t.Error("temp file should exist")
-	}
-	if !strings.Contains(path, "fio-test-") {
-		t.Errorf("path %q should contain pattern", path)
-	}
-}
-
-func TestWriteTemp(t *testing.T) {
-	path, err := WriteTemp("", "fio-test-*.txt", []byte("hello"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer Remove(path)
-
-	data, err := Read(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", data, "hello")
-	}
-}
-
-// ---------- Info Tests ----------
-
-func TestExists(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	if !Exists(path) {
-		t.Error("file should exist")
-	}
-	if Exists(filepath.Join(dir, "nonexistent")) {
-		t.Error("file should not exist")
-	}
-	if !Exists(dir) {
-		t.Error("directory should exist")
-	}
-}
-
-func TestExistsWithError(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	exists, err := ExistsWithError(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !exists {
-		t.Error("file should exist")
-	}
-
-	exists, err = ExistsWithError(filepath.Join(dir, "nonexistent"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exists {
-		t.Error("file should not exist")
-	}
-}
-
-func TestIsDir(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	isDir, err := IsDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isDir {
-		t.Error("should be directory")
-	}
-
-	isDir, err = IsDir(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isDir {
-		t.Error("should not be directory")
-	}
-
-	isDir, err = IsDir(filepath.Join(dir, "nonexistent"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isDir {
-		t.Error("nonexistent should return false")
-	}
-}
-
-func TestIsFile(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	isFile, err := IsFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isFile {
-		t.Error("should be file")
-	}
-
-	isFile, err = IsFile(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isFile {
-		t.Error("directory should not be file")
-	}
-}
-
-func TestIsSymlink(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-	link := filepath.Join(dir, "link")
-
-	err := os.Symlink(path, link)
-	if err != nil {
-		t.Skip("symlinks not supported")
-	}
-
-	isSymlink, err := IsSymlink(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isSymlink {
-		t.Error("should be symlink")
-	}
-
-	isSymlink, err = IsSymlink(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if isSymlink {
-		t.Error("regular file should not be symlink")
-	}
-}
-
-func TestSize(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	size, err := Size(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size != 5 {
-		t.Errorf("got %d, want 5", size)
-	}
-}
-
-func TestModTime(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	modTime, err := ModTime(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Should be recent
-	if time.Since(modTime) > time.Minute {
-		t.Error("mod time should be recent")
-	}
-}
-
-func TestFileInfo(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	info, err := FileInfo(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Name() != "test.txt" {
-		t.Errorf("got %q, want %q", info.Name(), "test.txt")
-	}
-	if info.Size() != 5 {
-		t.Errorf("got %d, want 5", info.Size())
-	}
-}
-
-// ---------- Directory Tests ----------
-
-func TestEnsureDir(t *testing.T) {
-	dir := tempDir(t)
-	path := filepath.Join(dir, "a", "b", "c")
-
-	err := EnsureDir(path, 0o755)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	isDir, err := IsDir(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isDir {
-		t.Error("should create directory")
-	}
-
-	// Empty path should be no-op
-	err = EnsureDir("", 0o755)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// "." should be no-op
-	err = EnsureDir(".", 0o755)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestListDir(t *testing.T) {
-	dir := tempDir(t)
-	tempFile(t, dir, "a.txt", "a")
-	tempFile(t, dir, "b.txt", "b")
-	os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
-
-	entries, err := ListDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 3 {
-		t.Errorf("got %d entries, want 3", len(entries))
-	}
-}
-
-func TestWalkFiles(t *testing.T) {
-	dir := tempDir(t)
-	tempFile(t, dir, "a.txt", "a")
-	subdir := filepath.Join(dir, "subdir")
-	os.Mkdir(subdir, 0o755)
-	tempFile(t, subdir, "b.txt", "b")
-
-	var files []string
-	err := WalkFiles(dir, func(path string, info fs.FileInfo) error {
-		files = append(files, info.Name())
-		return nil
+	out, err = Process(ctx, BytesSource([]byte("xyz")), Out(Txt), func(r io.Reader, w io.Writer) error {
+		_, err := io.Copy(w, r)
+		return err
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Process: %v", err)
 	}
-	if len(files) != 2 {
-		t.Errorf("got %d files, want 2", len(files))
-	}
-}
-
-func TestGlob(t *testing.T) {
-	dir := tempDir(t)
-	tempFile(t, dir, "a.txt", "a")
-	tempFile(t, dir, "b.txt", "b")
-	tempFile(t, dir, "c.json", "c")
-
-	matches, err := Glob(filepath.Join(dir, "*.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 2 {
-		t.Errorf("got %d matches, want 2", len(matches))
+	got, _ = out.Bytes()
+	if string(got) != "xyz" {
+		t.Fatalf("Process bytes = %q", string(got))
 	}
 }
 
-// ---------- Copy & Move Tests ----------
+func TestReadAndResults(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-func TestCopy(t *testing.T) {
-	dir := tempDir(t)
-	src := tempFile(t, dir, "src.txt", "hello world")
-	dst := filepath.Join(dir, "subdir", "dst.txt")
-
-	n, err := Copy(dst, src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 11 {
-		t.Errorf("got %d bytes, want 11", n)
-	}
-
-	data, err := Read(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello world" {
-		t.Errorf("got %q, want %q", data, "hello world")
-	}
-}
-
-func TestCopyDir(t *testing.T) {
-	dir := tempDir(t)
-
-	// Create source structure
-	srcDir := filepath.Join(dir, "src")
-	os.Mkdir(srcDir, 0o755)
-	tempFile(t, srcDir, "a.txt", "a")
-	subdir := filepath.Join(srcDir, "sub")
-	os.Mkdir(subdir, 0o755)
-	tempFile(t, subdir, "b.txt", "b")
-
-	// Copy
-	dstDir := filepath.Join(dir, "dst")
-	err := CopyDir(dstDir, srcDir)
-	if err != nil {
-		t.Fatal(err)
+	var n int
+	err := Read(ctx, BytesSource([]byte("abc")), func(r io.Reader) error {
+		b, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		n = len(b)
+		return nil
+	})
+	if err != nil || n != 3 {
+		t.Fatalf("Read = %d, %v", n, err)
 	}
 
-	// Verify
-	if !Exists(filepath.Join(dstDir, "a.txt")) {
-		t.Error("a.txt should exist")
-	}
-	if !Exists(filepath.Join(dstDir, "sub", "b.txt")) {
-		t.Error("sub/b.txt should exist")
+	res, err := ReadResult(ctx, BytesSource([]byte("abc")), func(r io.Reader) (*string, error) {
+		b, err := io.ReadAll(r)
+		s := string(b)
+		return &s, err
+	})
+	if err != nil || res == nil || *res != "abc" {
+		t.Fatalf("ReadResult = %v, %v", res, err)
 	}
 
-	data, err := Read(filepath.Join(dstDir, "sub", "b.txt"))
-	if err != nil {
-		t.Fatal(err)
+	out, got, err := ProcessResult(ctx, BytesSource([]byte("hi")), Out(Txt), func(r io.Reader, w io.Writer) (*string, error) {
+		_, err := io.Copy(w, r)
+		s := "ok"
+		return &s, err
+	})
+	if err != nil || got == nil || *got != "ok" {
+		t.Fatalf("ProcessResult = %v, %v", got, err)
 	}
-	if string(data) != "b" {
-		t.Errorf("got %q, want %q", data, "b")
+	if out == nil {
+		t.Fatalf("ProcessResult output is nil")
 	}
 }
 
-func TestMove(t *testing.T) {
-	dir := tempDir(t)
-	src := tempFile(t, dir, "src.txt", "hello")
-	dst := filepath.Join(dir, "dst.txt")
+func TestReadAtAndProcessAt(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	err := Move(dst, src)
+	got, err := ReadAtResult(ctx, BytesSource([]byte("hello")), func(ra io.ReaderAt, size int64) (*string, error) {
+		buf := make([]byte, 2)
+		if _, err := ra.ReadAt(buf, 1); err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if size != 5 {
+			return nil, errors.New("bad size")
+		}
+		s := string(buf)
+		return &s, nil
+	})
+	if err != nil || got == nil || *got != "el" {
+		t.Fatalf("ReadAt = %v, %v", got, err)
+	}
+
+	out, err := ProcessAt(ctx, BytesSource([]byte("hello")), Out(Txt), func(ra io.ReaderAt, size int64, w io.Writer) error {
+		buf := make([]byte, size)
+		if _, err := ra.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		_, err := w.Write(buf)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ProcessAt: %v", err)
 	}
-
-	if Exists(src) {
-		t.Error("source should not exist after move")
-	}
-
-	data, err := Read(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "hello" {
-		t.Errorf("got %q, want %q", data, "hello")
+	b, _ := out.Bytes()
+	if string(b) != "hello" {
+		t.Fatalf("ProcessAt bytes = %q", string(b))
 	}
 }
 
-// ---------- Remove Tests ----------
+func TestOutReuseMemory(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-func TestRemove(t *testing.T) {
-	dir := tempDir(t)
-	path := tempFile(t, dir, "test.txt", "hello")
-
-	err := Remove(path)
+	var out *Output
+	first, err := Copy(ctx, BytesSource([]byte("one")), Out(Txt, Memory, OutReuse(&out)))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Copy: %v", err)
+	}
+	if out == nil || out != first {
+		t.Fatalf("expected reuse output pointer")
 	}
 
-	if Exists(path) {
-		t.Error("file should be removed")
+	second, err := Copy(ctx, BytesSource([]byte("two")), Out(Txt, Memory, OutReuse(&out)))
+	if err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if second != out {
+		t.Fatalf("expected same output pointer")
+	}
+	b, _ := out.Bytes()
+	if string(b) != "two" {
+		t.Fatalf("reuse bytes = %q", string(b))
 	}
 }
 
-func TestRemoveAll(t *testing.T) {
-	dir := tempDir(t)
-	subdir := filepath.Join(dir, "subdir")
-	os.Mkdir(subdir, 0o755)
-	tempFile(t, subdir, "test.txt", "hello")
+func TestReusableFileInput(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	err := RemoveAll(subdir)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "in.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	in, err := OpenIn(ctx, PathSource(path), Reusable())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("OpenIn: %v", err)
 	}
+	t.Cleanup(func() { _ = in.Close() })
 
-	if Exists(subdir) {
-		t.Error("directory should be removed")
-	}
-}
-
-// ---------- Symlink Tests ----------
-
-func TestSymlink(t *testing.T) {
-	dir := tempDir(t)
-	target := tempFile(t, dir, "target.txt", "hello")
-	link := filepath.Join(dir, "subdir", "link")
-
-	err := Symlink(target, link)
-	if err != nil {
-		t.Skip("symlinks not supported")
-	}
-
-	isSymlink, err := IsSymlink(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isSymlink {
-		t.Error("should be symlink")
-	}
-}
-
-func TestReadLink(t *testing.T) {
-	dir := tempDir(t)
-	target := tempFile(t, dir, "target.txt", "hello")
-	link := filepath.Join(dir, "link")
-
-	err := os.Symlink(target, link)
-	if err != nil {
-		t.Skip("symlinks not supported")
-	}
-
-	got, err := ReadLink(link)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != target {
-		t.Errorf("got %q, want %q", got, target)
-	}
-}
-
-// ---------- Path Tests ----------
-
-func TestExt(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{"file.txt", ".txt"},
-		{"file.tar.gz", ".gz"},
-		{"file", ""},
-		{"/path/to/file.json", ".json"},
-	}
-
-	for _, tt := range tests {
-		got := Ext(tt.path)
-		if got != tt.want {
-			t.Errorf("Ext(%q) = %q, want %q", tt.path, got, tt.want)
+	for i := 0; i < 2; i++ {
+		out, err := Copy(ctx, InputSource(in), Out(Txt, Memory))
+		if err != nil {
+			t.Fatalf("Copy %d: %v", i, err)
+		}
+		b, _ := out.Bytes()
+		if string(b) != "hello" {
+			t.Fatalf("Copy %d bytes = %q", i, string(b))
 		}
 	}
 }
 
-func TestBase(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{"/path/to/file.txt", "file.txt"},
-		{"file.txt", "file.txt"},
-		{"/path/to/", "to"},
-	}
+func TestSizeHelpers(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	for _, tt := range tests {
-		got := Base(tt.path)
-		if got != tt.want {
-			t.Errorf("Base(%q) = %q, want %q", tt.path, got, tt.want)
-		}
+	size, err := Size(ctx, BytesSource([]byte("abc")))
+	if err != nil || size != 3 {
+		t.Fatalf("Size = %d, %v", size, err)
 	}
-}
-
-func TestBaseName(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{"/path/to/file.txt", "file"},
-		{"file.tar.gz", "file.tar"},
-		{"file", "file"},
+	if got := SizeFromStream(BytesSource([]byte("x"))); got != 1 {
+		t.Fatalf("SizeFromStream = %d", got)
 	}
-
-	for _, tt := range tests {
-		got := BaseName(tt.path)
-		if got != tt.want {
-			t.Errorf("BaseName(%q) = %q, want %q", tt.path, got, tt.want)
-		}
+	if got := SizeFromStream(ReaderSource(noSizeReader{})); got != -1 {
+		t.Fatalf("SizeFromStream non-sizer = %d", got)
+	}
+	if got := SizeFromStreamList([]Source{BytesSource([]byte("a")), BytesSource([]byte("b"))}); got != 2 {
+		t.Fatalf("SizeFromStreamList = %d", got)
 	}
 }
 
-func TestDir(t *testing.T) {
-	tests := []struct {
-		path string
-		want string
-	}{
-		{"/path/to/file.txt", "/path/to"},
-		{"file.txt", "."},
+func TestWriteFileHelpers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.txt")
+
+	n, err := WriteFile(strings.NewReader("abc"), path)
+	if err != nil || n != 3 {
+		t.Fatalf("WriteFile = %d, %v", n, err)
 	}
 
-	for _, tt := range tests {
-		got := Dir(tt.path)
-		if got != tt.want {
-			t.Errorf("Dir(%q) = %q, want %q", tt.path, got, tt.want)
-		}
+	n, err = WriteStreamToFile(BytesSource([]byte("xyz")), filepath.Join(dir, "out2.txt"))
+	if err != nil || n != 3 {
+		t.Fatalf("WriteStreamToFile = %d, %v", n, err)
 	}
 }
 
-func TestClean(t *testing.T) {
-	path, err := Clean("./test/../file.txt")
+func TestReadLinesHelpers(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
+	path := filepath.Join(t.TempDir(), "lines.txt")
+	if err := os.WriteFile(path, []byte("l1\nl2"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	var lines []string
+	if err := ReadLines(ctx, BytesSource([]byte("a\nb")), func(line string) error {
+		lines = append(lines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadLines: %v", err)
+	}
+	if len(lines) != 2 || lines[0] != "a" || lines[1] != "b" {
+		t.Fatalf("ReadLines = %v", lines)
+	}
+
+	lines = nil
+	if err := ReadFileLines(ctx, path, func(line string) error {
+		lines = append(lines, line)
+		return nil
+	}); err != nil {
+		t.Fatalf("ReadFileLines: %v", err)
+	}
+	if len(lines) != 2 || lines[0] != "l1" || lines[1] != "l2" {
+		t.Fatalf("ReadFileLines = %v", lines)
+	}
+}
+
+func TestOpenInReusable(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
+
+	in, err := OpenIn(ctx, BytesSource([]byte("abc")), Reusable())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("OpenIn: %v", err)
 	}
-	if !filepath.IsAbs(path) {
-		t.Errorf("path %q should be absolute", path)
+	t.Cleanup(func() { _ = in.Close() })
+
+	readOnce := func() string {
+		got, err := ReadResult(ctx, InputSource(in), func(r io.Reader) (*string, error) {
+			b, err := io.ReadAll(r)
+			if err != nil {
+				return nil, err
+			}
+			s := string(b)
+			return &s, nil
+		})
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if got == nil {
+			t.Fatalf("Read: nil result")
+		}
+		return *got
 	}
-	if !strings.HasSuffix(path, "file.txt") {
-		t.Errorf("path %q should end with file.txt", path)
+	if got := readOnce(); got != "abc" {
+		t.Fatalf("Read once = %q", got)
+	}
+	if got := readOnce(); got != "abc" {
+		t.Fatalf("Read twice = %q", got)
 	}
 }
 
-// ---------- Misc Tests ----------
-
-func TestTouch(t *testing.T) {
-	dir := tempDir(t)
-
-	// Create new file
-	path := filepath.Join(dir, "subdir", "touch.txt")
-	err := Touch(path)
+func TestDownloadReaderCloser(t *testing.T) {
+	called := 0
+	rc, err := NewDownloadReaderCloser(BytesSource([]byte("abc")), func() { called++ })
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewDownloadReaderCloser: %v", err)
 	}
-	if !Exists(path) {
-		t.Error("file should exist")
+	b, err := io.ReadAll(rc)
+	if err != nil || string(b) != "abc" {
+		t.Fatalf("ReadAll = %q, %v", string(b), err)
 	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("cleanup called %d", called)
+	}
+}
 
-	// Update existing file
-	oldTime, _ := ModTime(path)
-	time.Sleep(10 * time.Millisecond)
+func TestToReaderAtVariants(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	err = Touch(path)
+	res, err := ToReaderAt(ctx, bytes.NewReader([]byte("hello")))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ToReaderAt: %v", err)
 	}
+	if res.Source() != readerAtSourceDirect {
+		t.Fatalf("source = %s", res.Source())
+	}
+	if res.Size() != 5 {
+		t.Fatalf("size = %d", res.Size())
+	}
+	_ = res.Cleanup()
 
-	newTime, _ := ModTime(path)
-	if !newTime.After(oldTime) {
-		t.Error("mod time should be updated")
+	res, err = ToReaderAt(ctx, bytes.NewBufferString("abc"), WithMaxMemoryBytes(1))
+	if err != nil {
+		t.Fatalf("ToReaderAt: %v", err)
+	}
+	if res.Source() != readerAtSourceTempFile {
+		t.Fatalf("expected temp file source, got %s", res.Source())
+	}
+	_ = res.Cleanup()
+}
+
+func TestURLSource(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx, _ := newTestSession(t, Memory)
+	got, err := ReadResult(ctx, URLSource(srv.URL), func(r io.Reader) (*string, error) {
+		b, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		s := string(b)
+		return &s, nil
+	})
+	if err != nil || got == nil || *got != "ok" {
+		t.Fatalf("URLSource = %v, %v", got, err)
 	}
 }
 
-// ---------- Benchmark ----------
+func TestMultipartSource(t *testing.T) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "t.txt")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := part.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
-func BenchmarkRead(b *testing.B) {
-	dir, _ := os.MkdirTemp("", "fio-bench-*")
-	defer os.RemoveAll(dir)
+	req := httptest.NewRequest(http.MethodPost, "/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if err := req.ParseMultipartForm(1 << 20); err != nil {
+		t.Fatalf("ParseMultipartForm: %v", err)
+	}
+	files := req.MultipartForm.File["file"]
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file")
+	}
 
-	path := filepath.Join(dir, "bench.txt")
-	data := bytes.Repeat([]byte("x"), 1024)
-	os.WriteFile(path, data, 0o644)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		Read(path)
+	ctx, _ := newTestSession(t, Memory)
+	got, err := ReadResult(ctx, MultipartSource(files[0]), func(r io.Reader) (*string, error) {
+		b, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		s := string(b)
+		return &s, nil
+	})
+	if err != nil || got == nil || *got != "hello" {
+		t.Fatalf("MultipartSource = %v, %v", got, err)
 	}
 }
 
-func BenchmarkWrite(b *testing.B) {
-	dir, _ := os.MkdirTemp("", "fio-bench-*")
-	defer os.RemoveAll(dir)
+func TestErrorPaths(t *testing.T) {
+	ctx, _ := newTestSession(t, Memory)
 
-	data := bytes.Repeat([]byte("x"), 1024)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		path := filepath.Join(dir, "bench.txt")
-		Write(path, data, 0o644)
+	if err := Read(ctx, BytesSource([]byte("x")), nil); !errors.Is(err, ErrNilFunc) {
+		t.Fatalf("Read nil fn: %v", err)
 	}
-}
-
-func BenchmarkSafeWrite(b *testing.B) {
-	dir, _ := os.MkdirTemp("", "fio-bench-*")
-	defer os.RemoveAll(dir)
-
-	data := bytes.Repeat([]byte("x"), 1024)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		path := filepath.Join(dir, "bench.txt")
-		SafeWrite(path, data, 0o644)
+	if _, err := Copy(ctx, nil, Out(".txt")); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("Copy nil source: %v", err)
 	}
-}
-
-func BenchmarkCopy(b *testing.B) {
-	dir, _ := os.MkdirTemp("", "fio-bench-*")
-	defer os.RemoveAll(dir)
-
-	src := filepath.Join(dir, "src.txt")
-	data := bytes.Repeat([]byte("x"), 1024*1024) // 1MB
-	os.WriteFile(src, data, 0o644)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		dst := filepath.Join(dir, "dst.txt")
-		Copy(dst, src)
+	if _, err := Size(context.Background(), nil); !errors.Is(err, ErrNilSource) {
+		t.Fatalf("Size nil source: %v", err)
+	}
+	if _, err := NewDownloadReaderCloser(nil); err == nil {
+		t.Fatalf("expected error for nil source")
 	}
 }
